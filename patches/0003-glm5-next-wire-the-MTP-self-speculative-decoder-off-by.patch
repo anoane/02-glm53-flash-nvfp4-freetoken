@@ -1,0 +1,113 @@
+From Mon Sep 17 00:00:00 2001
+From: anoane <anos@hotmail.it>
+Date: Wed, 2 Sep 2026 18:15:45 +0000
+Subject: [PATCH 3/5] glm5_next: wire the MTP self-speculative decoder (off by
+ default)
+
+spec.py implements the full draft/verify/accept/commit/refresh state machine
+but nothing constructed it and Req had no spec_alloc_len, so
+FREETOKEN_GLM5_MTP=1 only loaded the layer-45 head.
+
+- core.Req: spec_alloc_len (KV length pre-allocated for the draft horizon;
+  0 until CacheManager.allocate_paged extends it).
+- engine.forward_batch: force_eager flag so the bootstrap step can bypass
+  the captured graph (model.last_pre_norm must belong to this batch).
+- scheduler: construct Glm5MtpSpec when the MTP head is loaded and
+  FREETOKEN_GLM5_SPEC=k is set; _forward runs try_step before the model
+  forward, honours wants_eager, and calls after_main after a normal forward.
+
+Measured (k=3, layer 45 resident, 576-slot cache, KV 131k, 2048-token
+chunks) on an offload-bound decode: 3.1 accepted tokens per round but
+245 ms per round, 200 ms of it verifying four positions through the
+host-pinned experts, i.e. ~12 tok/s against ~25 without speculation. The
+output also degenerated into a repeated fragment, and the horizon pages
+leak at request end (CacheManager integrity assert). Left disabled; the
+wiring is kept so the measurement can be reproduced or the state machine
+fixed.
+---
+ python/freetoken/core.py                |  3 +++
+ python/freetoken/engine/engine.py       |  6 ++++--
+ python/freetoken/scheduler/scheduler.py | 26 ++++++++++++++++++++++++-
+ 3 files changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/python/freetoken/core.py b/python/freetoken/core.py
+index ef0a539..59fd93e 100644
+--- a/python/freetoken/core.py
++++ b/python/freetoken/core.py
+@@ -64,6 +64,9 @@ class Req:
+     # handler must not free resources under an in-flight forward; it sets this flag and
+     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
+     aborted: bool = False
++    # glm5_next MTP self-speculation: KV length already allocated for the draft horizon
++    # (set by CacheManager.allocate_paged when FREETOKEN_GLM5_SPEC>0; 0 = no horizon yet).
++    spec_alloc_len: int = 0
+ 
+     def __post_init__(self) -> None:
+         assert self.input_ids.is_cpu
+diff --git a/python/freetoken/engine/engine.py b/python/freetoken/engine/engine.py
+index 73dc768..c2fef43 100644
+--- a/python/freetoken/engine/engine.py
++++ b/python/freetoken/engine/engine.py
+@@ -915,10 +915,12 @@ class Engine:
+             moe_offload_cache=self.moe_offload_cache,
+         )
+ 
+-    def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
++    def forward_batch(
++        self, batch: Batch, args: BatchSamplingArgs, force_eager: bool = False
++    ) -> ForwardOutput:
+         assert torch.cuda.current_stream() == self.stream
+         with self.ctx.forward_batch(batch):
+-            if self.graph_runner.can_use_cuda_graph(batch):
++            if not force_eager and self.graph_runner.can_use_cuda_graph(batch):
+                 logits = self.graph_runner.replay(batch)
+             else:
+                 logits = self.model.forward()
+diff --git a/python/freetoken/scheduler/scheduler.py b/python/freetoken/scheduler/scheduler.py
+index f6fe55b..662dc33 100644
+--- a/python/freetoken/scheduler/scheduler.py
++++ b/python/freetoken/scheduler/scheduler.py
+@@ -88,6 +88,24 @@ class Scheduler(SchedulerIOMixin):
+             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
+         )
+         self.decode_manager = DecodeManager(config.page_size)
++        # GLM-5.3-Flash MTP self-speculative decoding (glm5_next/spec.py): armed when the
++        # MTP head is loaded (FREETOKEN_GLM5_MTP=1, layer 45 resident) and a spec horizon
++        # is set (FREETOKEN_GLM5_SPEC=k). Greedy bs==1 only; every other step falls through.
++        self.spec = None
++        try:
++            _k = int(getattr(self.cache_manager, "spec_horizon", 0) or 0)
++            _model = self.engine.model
++            _ga = getattr(getattr(_model, "config", None), "glm5_args", None)
++            if _k > 0 and _ga is not None and getattr(_ga, "mtp_enabled", False) \
++                    and getattr(_model, "mtp", None) is not None:
++                from freetoken.models.glm5_next.spec import Glm5MtpSpec
++                self.spec = Glm5MtpSpec(self.engine, _k)
++                logger.info_rank0(f"glm5_next MTP self-speculative decoding armed (horizon k={_k})")
++            elif _k > 0:
++                logger.info_rank0("FREETOKEN_GLM5_SPEC set but MTP head not loaded; spec disabled")
++        except Exception as _e:  # never let spec wiring take the scheduler down
++            logger.warning(f"glm5_next MTP spec not armed: {_e!r}")
++            self.spec = None
+         self.prefill_manager = PrefillManager(
+             self.cache_manager, self.table_manager, self.decode_manager
+         )
+@@ -941,7 +959,13 @@ class Scheduler(SchedulerIOMixin):
+         batch.input_ids = self.token_pool[input_mapping]
+         if self.toolcall_anchor_id is not None and not batch.is_prefill:
+             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
+-        forward_output = self.engine.forward_batch(batch, sample_args)
++        spec = getattr(self, "spec", None)
++        forward_output = spec.try_step(batch) if spec is not None else None
++        if forward_output is None:
++            force_eager = spec is not None and spec.wants_eager(batch)
++            forward_output = self.engine.forward_batch(batch, sample_args, force_eager=force_eager)
++            if spec is not None:
++                spec.after_main(batch, forward_output.next_tokens_gpu)
+         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+         self.decode_manager.filter_reqs(forward_input.batch.reqs)
+         return forward_output
+-- 
+2.43.0
+
+

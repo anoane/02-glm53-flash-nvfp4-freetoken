@@ -1,0 +1,26 @@
+[Unit]
+Description=FreeToken GLM-5.3-Flash NVFP4 (b12x sm_120) on RTX PRO 6000 with DDR5 expert offload
+Documentation=file:///root/workspace/glm53-freetoken-serve/README.md
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+# The exl3 server binds the same GPU; never run both.
+Conflicts=glm53-sec.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/workspace/glm53-freetoken-serve
+Environment=SERVE_ENV=/root/workspace/glm53-freetoken-serve/config/serve.env
+ExecStartPre=-/usr/bin/docker rm -f ft-serve
+ExecStart=/root/workspace/glm53-freetoken-serve/bin/serve_ft.sh --foreground
+ExecStop=/usr/bin/docker stop -t 30 ft-serve
+# Load pins ~95 GiB of host RAM and repacks 17 resident layers; cold JIT adds a minute.
+TimeoutStartSec=1800
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=30
+# memguard runs as a child of this cgroup; stopping the unit stops both.
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

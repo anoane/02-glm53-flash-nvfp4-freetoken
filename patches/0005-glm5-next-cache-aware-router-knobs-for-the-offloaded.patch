@@ -1,0 +1,96 @@
+From Mon Sep 17 00:00:00 2001
+From: anoane <anos@hotmail.it>
+Date: Thu, 3 Sep 2026 01:34:26 +0000
+Subject: [PATCH 5/5] glm5_next: cache-aware router knobs for the offloaded
+ layers (env-gated, default off)
+
+Decode on a single 96 GB card is bound by the bytes of cold experts fetched over
+PCIe per token (~1.75 GB at 60% miss rate over the 25 host-pinned layers), not by
+compute. Two selection-only knobs reduce those bytes; both apply only to layers
+served from the offload cache and leave the VRAM-resident layers exact:
+
+- FREETOKEN_GLM5_CACHE_BIAS=b  adds b to the selection score (sigmoid score plus
+  e_score_correction_bias) of experts currently present in the VRAM slot cache
+  (offload_cache.slot_for_id[bank] >= 0, read on device, CUDA-graph safe). The
+  routing weights are still gathered from the unbiased scores, so an expert that
+  is chosen keeps its true weight; only near-tie choices move to cached experts.
+- FREETOKEN_GLM5_OFFLOAD_TOPK=k  routes top-k instead of num_experts_per_tok on
+  offloaded layers (weights renormalized over the k kept).
+
+Both are read once at construction in Glm5SparseBlock._make_experts and honoured
+in GlmMoeDsaSparseBlock._route; the fused route kernel keeps serving the plain
+top-k case, the bias takes the unfused path.
+
+Measured on one RTX PRO 6000 (17 resident layers, 576-slot cache, 3k greedy
+tokens on a 23k-token C review prompt; misses per step over the offloaded
+layers / decode tok/s): baseline 117.2 / 22.0; CACHE_BIAS=0.02 92.4 / 25.2;
+CACHE_BIAS=0.05 75.7 / 28.4; OFFLOAD_TOPK=6 77.6 / 28.6. Task quality per
+setting is reported in the serving recipe.
+---
+ python/freetoken/models/glm5_next/moe.py   |  7 +++++++
+ python/freetoken/models/glm_moe_dsa/moe.py | 20 +++++++++++++++++---
+ 2 files changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/python/freetoken/models/glm5_next/moe.py b/python/freetoken/models/glm5_next/moe.py
+index c52d3e6..14b9af2 100644
+--- a/python/freetoken/models/glm5_next/moe.py
++++ b/python/freetoken/models/glm5_next/moe.py
+@@ -24,6 +24,13 @@ def offload_moe_layers(config: ModelConfig):
+ class Glm5SparseBlock(GlmMoeDsaSparseBlock):
+     def _make_experts(self, config: ModelConfig, layer_id: int):
+         activation = "swiglu_clamp" if getattr(config, "swiglu_limit", None) else "silu"
++        import os as _os
++        # EXPERIMENT (env-gated, default off): byte-reduction knobs for OFFLOADED layers only.
++        #   FREETOKEN_GLM5_OFFLOAD_TOPK=k  route top-k (< num_experts_per_tok) on offloaded layers
++        #   FREETOKEN_GLM5_CACHE_BIAS=b    add b to the selection score of experts already cached
++        self._offloaded = layer_id not in config.glm5_args.resident_layer_ids
++        self._route_topk = int(_os.environ.get("FREETOKEN_GLM5_OFFLOAD_TOPK", "0") or 0)
++        self._cache_bias = float(_os.environ.get("FREETOKEN_GLM5_CACHE_BIAS", "0") or 0.0)
+         if layer_id in config.glm5_args.resident_layer_ids:
+             return ResidentNvfp4Experts(config, activation, layer_id=layer_id)
+         # Offload bank ids are dense over the NON-resident MoE layers.
+diff --git a/python/freetoken/models/glm_moe_dsa/moe.py b/python/freetoken/models/glm_moe_dsa/moe.py
+index b2e9797..792fb3c 100644
+--- a/python/freetoken/models/glm_moe_dsa/moe.py
++++ b/python/freetoken/models/glm_moe_dsa/moe.py
+@@ -74,20 +74,34 @@ class GlmMoeDsaSparseBlock(BaseOP):
+     def _route(self, hidden_states: torch.Tensor) -> TopK:
+         # HF computes the router logits in fp32; the gate is tiny so we match it exactly.
+         logits = F.linear(hidden_states.float(), self.gate.weight.float())
+-        if self.n_group <= 1 and _os.environ.get("FREETOKEN_FUSED_ROUTE", "1") == "1":
++        k = self.top_k
++        cache_bias = 0.0
++        if getattr(self, "_offloaded", False):
++            if getattr(self, "_route_topk", 0):
++                k = min(self.top_k, int(self._route_topk))
++            cache_bias = float(getattr(self, "_cache_bias", 0.0))
++        if self.n_group <= 1 and cache_bias == 0.0 and _os.environ.get("FREETOKEN_FUSED_ROUTE", "1") == "1":
+             # tail-fusion (2026-08-28): sigmoid/+bias/topk/gather/renorm/cast chain
+             # (~8 launches) -> one kernel. Same math; see fused_route docstring.
+             from freetoken.kernel.triton.fused_route import fused_route
+ 
+             return fused_route(
+-                logits, self.e_score_correction_bias, self.top_k,
++                logits, self.e_score_correction_bias, k,
+                 self.norm_topk_prob, self.routed_scaling_factor,
+             )
+         scores = logits.sigmoid()
+         scores_for_choice = scores + self.e_score_correction_bias.float()
++        if cache_bias != 0.0:
++            # selection-only bias toward experts already in the VRAM slot cache (offloaded
++            # layers): slot_for_id[bank*E + e] >= 0 means cached. Read on device, graph-safe.
++            _cache = self.experts.offload_cache
++            _b = int(self.experts.layer_id)
++            _E = self.num_experts
++            _cached = (_cache.slot_for_id[_b] >= 0).to(scores_for_choice.dtype)  # [E] row of the [bank, E] table
++            scores_for_choice = scores_for_choice + cache_bias * _cached
+         if self.n_group > 1:
+             scores_for_choice = self._group_limited(scores_for_choice)
+-        _, topk_ids = torch.topk(scores_for_choice, self.top_k, dim=-1)
++        _, topk_ids = torch.topk(scores_for_choice, k, dim=-1)
+         topk_weights = scores.gather(-1, topk_ids)
+         if self.norm_topk_prob:
+             topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+-- 
+2.43.0
+

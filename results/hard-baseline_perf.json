@@ -1,0 +1,37 @@
+{
+ "label": "hard-baseline",
+ "timestamp_utc": "2026-09-03T03:20:29Z",
+ "url": "http://127.0.0.1:1919/v1/chat/completions",
+ "model": "model",
+ "prompt_sha256": "bc26354f5537a6ebac260c63289ee2c4b735f5b7e1ba1b5ce7ab995b65fb707a",
+ "corpus_sha256": "3a51439c4a6102c93d11917299a727c0b004b663cbf5dc20def80d9fbb7324b9",
+ "max_tokens": 200000,
+ "temperature": 0.0,
+ "reasoning_effort": null,
+ "finish_reason": "length",
+ "usage": {
+  "prompt_tokens": 88671,
+  "completion_tokens": 173472,
+  "total_tokens": 262143
+ },
+ "timing": {
+  "ttft_s": 33.25896054599434,
+  "wall_s": 4184.856442606004,
+  "decode_window_s": 4151.5974820600095,
+  "prefill_tok_s": 2666.0785107031675,
+  "decode_tok_s": 41.784156761248504,
+  "overall_tok_s": 41.452317989664444,
+  "inter_token_ms_mean": 23.932510545001822,
+  "inter_token_ms_p50": 19.376037002075464,
+  "inter_token_ms_p99": 61.15277200296987,
+  "time_to_first_answer_s": null
+ },
+ "counts": {
+  "reasoning_chars": 667612,
+  "answer_chars": 0,
+  "reasoning_chunks": 173472,
+  "answer_chunks": 0
+ },
+ "reasoning": "Let me carefully review this code. It's a large codebase with many files, most of which contain repetitive \"filler\" functions. I need to find the genuine security defects. Let me go through each file and look for the non-boilerplate functions \u2014 the ones with actual logic that could contain vulnerabilities.\n\nLet me scan for functions that stand out:\n\n**File 00 (bridged_request_demultiplexer_00.c):**\n- `encode_policy_0011(const char *user_agent, char *out, size_t out_sz)`:\n```c\nchar scratch[64];\nsize_t n = strlen(user_agent);\nstrcpy(scratch, user_agent);\n```\nThis is a classic buffer overflow \u2014 `strcpy` into a 64-byte stack buffer from an attacker-controlled `user_agent` string with no bounds check. CWE-120 (buffer copy without checking size of input) / CWE-121 stack buffer overflow. The `n` is computed but never used for bounds. This is a genuine finding.\n\n**File 01 (bridged_session_table_01.c):** All boilerplate. Nothing.\n\n**File 02 (bridged_configuration_loader_02.c):**\n- `merge_channel_0208(uint32_t count, uint32_t elem_size)`:\n```c\nuint32_t total = count * elem_size;\nif (total > MAX_TABLE_BYTES)\n    return NULL;\nvoid *p = malloc(total);\n```\nInteger overflow: `count * elem_size` computed in 32-bit unsigned arithmetic can wrap around. E.g., count = 0x10000, elem_size = 0x10000 \u2192 total = 0 (2^32 mod 2^32). Then malloc(0) succeeds, and later use of the table with count elements would overflow. CWE-190 integer overflow leading to heap overflow (CWE-122 / CWE-787). The check `total > MAX_TABLE_BYTES` happens after the multiplication, so overflow bypasses it. Genuine finding.\n\n**File 03:** boilerplate only.\n\n**File 04:** boilerplate only.\n\n**File 05:** boilerplate only.\n\n**File 06:** boilerplate only.\n\n**File 07:** boilerplate only.\n\n**File 08:** boilerplate only.\n\n**File 09:** boilerplate only.\n\n**File 10:** boilerplate only.\n\n**File 11 (bridged_plugin_loader_11.c):**\n- `rotate_header_1103(const char *src, char *dst, size_t dst_sz)`:\n```c\nsize_t i;\nfor (i = 0; i <= dst_\n[...truncated for the repo: 667612 chars total, ran into the 262144-token context ceiling with no answer...]",
+ "answer": ""
+}

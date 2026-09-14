@@ -1,0 +1,204 @@
+From Mon Sep 17 00:00:00 2001
+From: anoane <anos@hotmail.it>
+Date: Wed, 2 Sep 2026 18:15:45 +0000
+Subject: [PATCH 1/5] moe: serve the GLM-5.3 clamped SwiGLU on the b12x (SM12x
+ W4A16) backend
+
+GLM-5.3-Flash routes its experts through silu(min(gate, L)) * clamp(up, -L, L)
+with L = swiglu_limit (10.0). The b12x backend refused that activation and
+auto fell back to the Triton inline-dequant kernels, although flashinfer's
+W4A16 kernel already implements the clamp: with any swiglu_limit set,
+_clamp_swiglu_inputs clips gate from above and up to +-limit before the
+plain silu*up epilogue, which is exactly the GLM formula (its validator only
+accepts silu/relu2, so the swigluoai name is not needed).
+
+- nvfp4_backends.select_nvfp4_backend: swiglu_clamp is b12x-eligible
+  (never marlin; forcing marlin still raises).
+- nvfp4_backends.b12x_fused_experts: new act_limit argument; swiglu_clamp
+  launches with activation="silu" and swiglu_limit=L through a local
+  _launch_b12x_moe that mirrors flashinfer's _launch_sm120_w4a16_moe but
+  forwards the swiglu scalars to run_w4a16_moe (the upstream wrapper drops
+  them, which would silently apply the gpt-oss defaults).
+- layers/moe.py: pass the layer's swiglu_limit to the b12x call.
+- glm5_next/moe.py: hand swiglu_limit to make_moe_layer via extra_attrs.
+  The offload layer reads its clamp from an instance attribute and defaults
+  to +inf when it is absent, so the offloaded routed experts previously ran
+  unclamped while the resident layers and the shared expert clamped at L.
+
+Measured on one RTX PRO 6000 (17 resident layers, 620-slot cache, 4096-token
+prefill chunks, 23k-token prompt): prefill 703 -> 1,050 tok/s, time to first
+token 32.7 -> 21.9 s, decode unchanged (22 tok/s, PCIe-bound on misses),
+identical task score.
+---
+ python/freetoken/layers/moe.py           |  2 +
+ python/freetoken/models/glm5_next/moe.py |  6 ++
+ python/freetoken/moe/nvfp4_backends.py   | 83 ++++++++++++++++++++----
+ 3 files changed, 79 insertions(+), 12 deletions(-)
+
+diff --git a/python/freetoken/layers/moe.py b/python/freetoken/layers/moe.py
+index d68d8de..ebbf41b 100644
+--- a/python/freetoken/layers/moe.py
++++ b/python/freetoken/layers/moe.py
+@@ -462,6 +462,8 @@ class OffloadMoELayer(MoELayer):
+                 topk_ids,
+                 self.activation,
+                 self.apply_router_weight_on_input,
++                # b12x: pass the clamp limit; the W4A16 kernel applies it under plain silu
++                **({"act_limit": getattr(self, "swiglu_limit", None)} if fmt == "nvfp4_b12x" else {}),
+             )
+         if fmt == "nvfp4":
+             # FreeToken's Triton inline-dequant kernels over the native ModelOpt
+diff --git a/python/freetoken/models/glm5_next/moe.py b/python/freetoken/models/glm5_next/moe.py
+index 7b8e514..c52d3e6 100644
+--- a/python/freetoken/models/glm5_next/moe.py
++++ b/python/freetoken/models/glm5_next/moe.py
+@@ -32,6 +32,12 @@ class Glm5SparseBlock(GlmMoeDsaSparseBlock):
+             layer_id=offload_moe_layers(config).index(layer_id),
+             renormalize=config.norm_topk_prob,
+             activation=activation,
++            # The offload layer reads its clamp from an instance attribute (layers/moe.py:
++            # getattr(self, "swiglu_limit", None) -> +inf when absent). Without this the
++            # offloaded routed experts ran UNCLAMPED while resident layers clamped at L.
++            extra_attrs=(
++                {"swiglu_limit": float(config.swiglu_limit)} if activation == "swiglu_clamp" else None
++            ),
+         )
+ 
+     def __init__(self, config: ModelConfig, layer_id: int):
+diff --git a/python/freetoken/moe/nvfp4_backends.py b/python/freetoken/moe/nvfp4_backends.py
+index e8a3c6f..3fefe36 100644
+--- a/python/freetoken/moe/nvfp4_backends.py
++++ b/python/freetoken/moe/nvfp4_backends.py
+@@ -215,7 +215,10 @@ def select_nvfp4_backend(
+         )
+     if requested == "triton":
+         return "triton"
+-    if activation != "silu":
++    # swiglu_clamp (GLM-5.3: silu(min(g,L)) * clamp(u,-L,L)) is exactly the flashinfer
++    # swigluoai epilogue with alpha=1, beta=0, limit=L -- b12x can serve it; Marlin cannot.
++    _b12x_ok = activation in ("silu", "swiglu_clamp")
++    if not _b12x_ok or (activation == "swiglu_clamp" and requested == "marlin"):
+         if requested != "auto":
+             raise RuntimeError(
+                 f"--nvfp4-backend={requested} only supports silu routed experts (its fused "
+@@ -248,6 +251,7 @@ def select_nvfp4_backend(
+     cc = torch.cuda.get_device_capability(device)
+     if (
+         (8, 0) <= cc < (10, 0)
++        and activation == "silu"
+         and importlib.util.find_spec("vllm") is not None
+         and _donor_symbols_ok("marlin")
+     ):
+@@ -712,6 +716,7 @@ def b12x_fused_experts(
+     topk_ids: torch.Tensor,
+     activation: str,
+     apply_router_weight_on_input: bool,
++    act_limit: float | None = None,
+ ) -> torch.Tensor:
+     """SM12x W4A16 fused MoE over cache slots (same calling convention as
+     :func:`marlin_fused_experts`). Requires sm_120/121 + a CUDA>=13 driver; reached only
+@@ -734,7 +739,21 @@ def b12x_fused_experts(
+         W4A16PackedWeights,
+     )
+ 
+-    assert activation == "silu", "b12x backend supports gated silu only"
++    if activation == "silu":
++        fi_act, swiglu = "silu", {}
++    elif activation == "swiglu_clamp":
++        # GLM-5.3: silu(min(gate, L)) * clamp(up, -L, L) == swigluoai(alpha=1, beta=0, limit=L)
++        assert act_limit is not None and 0.0 < float(act_limit) < float("inf"), act_limit
++        # The W4A16 kernel clamps gate (from above) and up (to +-limit) for ANY gated
++        # activation when swiglu_limit is set (_clamp_swiglu_inputs), then applies plain
++        # silu*up -- exactly the GLM formula. Its validator only accepts silu/relu2, so
++        # keep activation=silu and pass the limit alone (alpha=1, beta=0 defaults).
++        fi_act = "silu"
++        swiglu = dict(swiglu_limit=float(act_limit))
++    else:
++        raise RuntimeError(
++            f"b12x backend supports silu / swiglu_clamp routed experts, got {activation!r}"
++        )
+     assert not apply_router_weight_on_input
+     num_experts = gate_up_q.size(0)
+     hidden_size = hidden_states.size(-1)
+@@ -758,27 +777,67 @@ def b12x_fused_experts(
+     out = torch.empty(
+         hidden_states.size(0), hidden_size, dtype=hidden_states.dtype, device=hidden_states.device
+     )
+-    _launch_sm120_w4a16_moe(
++    _launch_b12x_moe(
+         a=hidden_states,
+         topk_ids=topk_ids,
+         topk_weights=topk_weights,
+-        w1_weight=gate_up_q,
+-        w1_weight_sf=gate_up_s,
+-        w1_alpha=gate_up_alpha,
+-        w2_weight=down_q,
+-        w2_weight_sf=down_s,
+-        w2_alpha=down_alpha,
+         num_experts=num_experts,
+         top_k=topk_ids.size(1),
+         num_local_experts=num_experts,
+         scatter_output=out,
+-        activation="silu",
+-        source_format="modelopt",
+-        _prepared_weights=prepared,
++        activation=fi_act,
++        swiglu=swiglu,
++        prepared=prepared,
+     )
+     return out
+ 
+ 
++def _launch_b12x_moe(*, a, topk_ids, topk_weights, num_experts, top_k, num_local_experts,
++                     scatter_output, activation, swiglu, prepared, fast_math=True):
++    """The upstream ``_launch_sm120_w4a16_moe`` with the swiglu scalars forwarded to
++    ``run_w4a16_moe``: the upstream wrapper drops them, so a clamped activation would
++    silently run with the gpt-oss defaults (limit 7, alpha 1.702, beta 1)."""
++    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
++        Sm120W4A16MoEWorkspace,
++        _get_cached_workspace,
++        _validate_w4a16_workspace,
++    )
++    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_kernel import run_w4a16_moe
++
++    if int(prepared.num_experts) != int(num_local_experts):
++        raise ValueError("num_local_experts must match the prepared expert count")
++    routed_rows = int(topk_ids.size(0)) * int(top_k)
++    k = int(a.size(1))
++    n = int(prepared.intermediate_size)
++    workspace = _get_cached_workspace(
++        backend="w4a16", state_E=num_local_experts, weight_E=num_experts,
++        routed_rows=routed_rows, k=k, n=n, num_topk=top_k, device=a.device,
++        quant_mode="w4a16", activation=activation,
++    )
++    if not isinstance(workspace, Sm120W4A16MoEWorkspace):
++        raise TypeError("expected a W4A16 workspace")
++    _validate_w4a16_workspace(
++        workspace, state_E=num_local_experts, weight_E=num_experts, routed_rows=routed_rows,
++        k=k, n=n, num_topk=top_k, device=a.device, activation=activation,
++    )
++    return run_w4a16_moe(
++        a, prepared, topk_weights, topk_ids,
++        activation=activation,
++        intermediate_cache13=workspace.intermediate_cache13,
++        intermediate_cache2=workspace.intermediate_cache2,
++        output=scatter_output,
++        fc1_c_tmp=workspace.fc1_c_tmp,
++        fc2_c_tmp=workspace.fc2_c_tmp,
++        packed_route_indices=workspace.packed_route_indices,
++        block_expert_ids=workspace.block_expert_ids,
++        packed_route_count=workspace.packed_route_count,
++        expert_offsets=workspace.expert_offsets,
++        expert_map=workspace.expert_map,
++        fast_math=fast_math,
++        **swiglu,
++    )
++
++
+ __all__ = [
+     "select_nvfp4_backend",
+     "marlin_repack_layer",
+-- 
+2.43.0
+
+

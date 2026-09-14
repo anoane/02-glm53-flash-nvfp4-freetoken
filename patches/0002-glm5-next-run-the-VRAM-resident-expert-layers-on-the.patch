@@ -1,0 +1,103 @@
+From Mon Sep 17 00:00:00 2001
+From: anoane <anos@hotmail.it>
+Date: Wed, 2 Sep 2026 18:15:45 +0000
+Subject: [PATCH 2/5] glm5_next: run the VRAM-resident expert layers on the
+ b12x backend
+
+ResidentNvfp4Experts kept its six native ModelOpt banks and always computed
+with the Triton kernels, so after the previous change 17 of 42 MoE layers
+were still on the slow path.
+
+When the process-wide NVFP4 backend resolves to b12x, load_state_dict now
+repacks the six banks in place with b12x_repack_layer (same bytes, done at
+load while VRAM is still free) and routed_forward calls b12x_fused_experts
+for both prefill and decode, passing the clamp limit. Banks that are not on
+CUDA, or a backend other than b12x, keep the Triton path.
+
+Measured on one RTX PRO 6000 with the same 23k-token prompt: prefill
+1,050 -> 1,695 tok/s and time to first token 21.9 -> 13.6 s at 4096-token
+chunks; 2,857 tok/s and 8.1 s at 8192-token chunks (which peaks at 97.1 of
+97.9 GB VRAM). Prefill is now bound by streaming the 25 host-pinned layers
+over PCIe (~1.7 s per chunk at 56 GB/s). Decode and task score unchanged.
+---
+ .../models/glm5_next/experts_resident.py      | 56 +++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+
+diff --git a/python/freetoken/models/glm5_next/experts_resident.py b/python/freetoken/models/glm5_next/experts_resident.py
+index 602a054..95366cb 100644
+--- a/python/freetoken/models/glm5_next/experts_resident.py
++++ b/python/freetoken/models/glm5_next/experts_resident.py
+@@ -39,6 +39,52 @@ class ResidentNvfp4Experts(BaseOP):
+         self.down_packed = torch.empty(e, h, i // 2, dtype=torch.uint8)
+         self.down_scale = torch.empty(e, h, i // 16, dtype=FP8)
+         self.down_global = torch.empty(e, h, dtype=torch.float16)
++        # b12x (flashinfer SM12x W4A16) path: set by _maybe_repack_b12x after load.
++        # Underscore names are skipped by BaseOP.state_dict/load_state_dict.
++        self._cfg = config
++        self._b12x = False
++        self._gu_alpha = None
++        self._dn_alpha = None
++
++    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
++        super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
++        self._maybe_repack_b12x()
++
++    def _maybe_repack_b12x(self) -> None:
++        """Repack the six native banks into the b12x layout when that backend is selected.
++        Mirrors expert_banks._nvfp4_banks for the offload layers so resident and offloaded
++        experts run the same kernel (same numerics, same epilogue)."""
++        from freetoken.moe.nvfp4_backends import b12x_repack_layer, select_nvfp4_backend
++        from freetoken.utils import init_logger
++
++        log = init_logger(__name__)
++        dev = self.gate_up_packed.device
++        if dev.type != "cuda":
++            return
++        try:
++            backend = select_nvfp4_backend(
++                dev, getattr(self._cfg, "moe_intermediate_size", None),
++                getattr(self._cfg, "nvfp4_backend", "auto"), activation=self.activation,
++            )
++        except Exception as e:  # forced backend unusable -> keep Triton
++            log.warning(f"resident layer {self.layer_id}: backend select failed ({e!r}); Triton")
++            return
++        if backend != "b12x":
++            return
++        names = ("gate_up_packed", "gate_up_scale", "gate_up_global",
++                 "down_packed", "down_scale", "down_global")
++        banks = {n: getattr(self, n) for n in names}
++        post, gu_alpha, dn_alpha = b12x_repack_layer(banks, self._cfg, dev)
++        for n in ("gate_up_packed", "gate_up_scale", "down_packed", "down_scale"):
++            setattr(self, n, post[n])
++        # globals are folded into the per-expert alphas; keep the attribute names valid
++        self.gate_up_global = gu_alpha
++        self.down_global = dn_alpha
++        self._gu_alpha, self._dn_alpha = gu_alpha, dn_alpha
++        self._b12x = True
++        del banks
++        torch.cuda.empty_cache()
++        log.info(f"resident layer {self.layer_id}: experts repacked for b12x")
+ 
+     def _views(self):
+         return (
+@@ -54,6 +100,16 @@ class ResidentNvfp4Experts(BaseOP):
+     ) -> torch.Tensor:
+         act_limit = self.swiglu_limit
+         act_limit = float("inf") if act_limit is None else float(act_limit)
++        if self._b12x:
++            from freetoken.moe.nvfp4_backends import b12x_fused_experts
++            return b12x_fused_experts(
++                hidden_states,
++                self.gate_up_packed, self.gate_up_scale, self._gu_alpha,
++                self.down_packed, self.down_scale, self._dn_alpha,
++                topk_weights, topk_ids,
++                self.activation, self.apply_router_weight_on_input,
++                act_limit=(None if act_limit == float("inf") else act_limit),
++            )
+         if get_global_ctx().batch.is_prefill:
+             from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
+ 
+-- 
+2.43.0
+
+

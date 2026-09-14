@@ -1,0 +1,96 @@
+{
+  "version": 4,
+  "timestamp": "2026-09-02T14:21:38+00:00",
+  "epoch": 1788358898,
+  "host": "2cf49ed705af",
+  "gpu": {
+    "index": 0,
+    "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "uuid": "GPU-<UUID>"
+  },
+  "cpu": {
+    "physical_cores": 24,
+    "threads_used": 24
+  },
+  "threshold": 2.0,
+  "ceilings": {
+    "cpu_stream_read_gbs": 55.87,
+    "pcie_linear_h2d_gbs": 56.11,
+    "pcie_linear_d2h_gbs": 57.01
+  },
+  "dtypes": {
+    "bf16": "offload",
+    "nvfp4": "offload",
+    "fp8_block": "offload",
+    "mxfp4_triton": "offload",
+    "ds_fp4": "offload"
+  },
+  "dtype_kernels": {
+    "bf16": {
+      "expert_bytes": 9437184,
+      "synth_experts": 128,
+      "cpu_moe_gbs": 53.59,
+      "cpu_moe_isa": "avx512bf16",
+      "isa_sweep": null,
+      "pcie_gather_gbs": 53.67,
+      "cpu_moe_overlap_gbs": 31.71,
+      "pcie_gather_overlap_gbs": 36.75,
+      "ratio": 0.999,
+      "recommended": "offload",
+      "note": null
+    },
+    "nvfp4": {
+      "expert_bytes": 7974912,
+      "synth_experts": 128,
+      "cpu_moe_gbs": 48.99,
+      "cpu_moe_isa": "avx512bf16+avx512vnni(nvfp4-w4a8)",
+      "isa_sweep": null,
+      "pcie_gather_gbs": 52.91,
+      "cpu_moe_overlap_gbs": 29.66,
+      "pcie_gather_overlap_gbs": 35.81,
+      "ratio": 0.926,
+      "recommended": "offload",
+      "note": null
+    },
+    "fp8_block": {
+      "expert_bytes": 3146112,
+      "synth_experts": 128,
+      "cpu_moe_gbs": null,
+      "cpu_moe_isa": null,
+      "isa_sweep": null,
+      "pcie_gather_gbs": 53.28,
+      "cpu_moe_overlap_gbs": null,
+      "pcie_gather_overlap_gbs": null,
+      "ratio": null,
+      "recommended": "offload",
+      "note": "CPU MoE has no fp8_block weight path; hybrid unavailable"
+    },
+    "mxfp4_triton": {
+      "expert_bytes": 13236480,
+      "synth_experts": 128,
+      "cpu_moe_gbs": 48.11,
+      "cpu_moe_isa": "avx512bf16",
+      "isa_sweep": null,
+      "pcie_gather_gbs": 53.35,
+      "cpu_moe_overlap_gbs": 30.53,
+      "pcie_gather_overlap_gbs": 35.05,
+      "ratio": 0.902,
+      "recommended": "offload",
+      "note": null
+    },
+    "ds_fp4": {
+      "expert_bytes": 13369344,
+      "synth_experts": 128,
+      "cpu_moe_gbs": 50.37,
+      "cpu_moe_isa": "avx512bf16",
+      "isa_sweep": null,
+      "pcie_gather_gbs": 53.01,
+      "cpu_moe_overlap_gbs": 28.84,
+      "pcie_gather_overlap_gbs": 36.41,
+      "ratio": 0.95,
+      "recommended": "offload",
+      "note": null
+    }
+  },
+  "workloads": {}
+}

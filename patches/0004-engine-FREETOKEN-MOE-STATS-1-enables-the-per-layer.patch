@@ -1,0 +1,69 @@
+From Mon Sep 17 00:00:00 2001
+From: anoane <anos@hotmail.it>
+Date: Thu, 3 Sep 2026 01:34:26 +0000
+Subject: [PATCH 4/5] engine: FREETOKEN_MOE_STATS=1 enables the per-layer
+ decode miss counters and logs them
+
+OffloadMoeCache already accumulates per-layer active/miss/call counters on device
+(lru_stats, graph-safe) behind EngineConfig.moe_collect_stats, but nothing turned
+the flag on from the command line and nothing read the counters back.
+
+- engine: FREETOKEN_MOE_STATS=1 sets cache.collect_stats before graph capture.
+- scheduler: every 250 decode steps log one "[moe-stats]" JSON line with
+  decode_miss_stats_per_layer() plus the offload-bank -> checkpoint-layer map
+  (glm5_next.moe.offload_moe_layers), so the cumulative miss rate of every
+  offloaded layer can be read from the serve log.
+
+Used to pick the VRAM-resident layer set from data: over 2,999 greedy decode
+steps on GLM-5.3-Flash the early layers miss hardest (3-6: 0.85-0.87, 7-10:
+0.77-0.80, 11-16: 0.65-0.74) while 18-19 and 34 miss ~0.51-0.53; the resulting
+set 3-16,23,43-44 covers 47% of all misses versus 45% for a head-plus-tail guess.
+---
+ python/freetoken/engine/engine.py       |  2 +-
+ python/freetoken/scheduler/scheduler.py | 16 ++++++++++++++++
+ 2 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/python/freetoken/engine/engine.py b/python/freetoken/engine/engine.py
+index c2fef43..bef13bd 100644
+--- a/python/freetoken/engine/engine.py
++++ b/python/freetoken/engine/engine.py
+@@ -630,7 +630,7 @@ class Engine:
+             self._resolve_hybrid_fetch(config, cache)
+         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
+         # captured and re-run on every decode replay.
+-        cache.collect_stats = config.moe_collect_stats
++        cache.collect_stats = config.moe_collect_stats or os.environ.get("FREETOKEN_MOE_STATS", "0") == "1"
+         # attach_offload_moe_cache walks for OffloadMoELayers, or defers to a model's
+         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
+         layers = attach_offload_moe_cache(self.model, cache)
+diff --git a/python/freetoken/scheduler/scheduler.py b/python/freetoken/scheduler/scheduler.py
+index 662dc33..d9f8b75 100644
+--- a/python/freetoken/scheduler/scheduler.py
++++ b/python/freetoken/scheduler/scheduler.py
+@@ -320,6 +320,22 @@ class Scheduler(SchedulerIOMixin):
+     def _process_last_data(self, last_data: ForwardData | None) -> None:
+         if last_data is None:
+             return
++        # diagnostic: cumulative per-layer decode miss stats every 250 steps (FREETOKEN_MOE_STATS=1)
++        try:
++            _c = getattr(self.engine, "moe_offload_cache", None)
++            if _c is not None and getattr(_c, "collect_stats", False):
++                self._msd = getattr(self, "_msd", 0) + 1
++                if self._msd % 250 == 0:
++                    import json as _json
++                    _pl = _c.decode_miss_stats_per_layer()["per_layer"]
++                    try:
++                        from freetoken.models.glm5_next.moe import offload_moe_layers
++                        _map = offload_moe_layers(self.engine.model.config)
++                    except Exception:
++                        _map = None
++                    logger.info_rank0("[moe-stats] " + _json.dumps({"bank_to_layer": _map, "per_layer": [{k: (round(v, 3) if isinstance(v, float) else v) for k, v in d.items()} for d in _pl]}))
++        except Exception as _e:
++            logger.warning(f"[moe-stats] dump failed: {_e!r}")
+ 
+         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+         copy_done.synchronize()
+-- 
+2.43.0
+
+
